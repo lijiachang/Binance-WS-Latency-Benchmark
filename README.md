@@ -48,12 +48,17 @@ Where `<unit>` is `ms`, `us`, or `ns` depending on `--latency-unit` (time refere
 
 Requires Python 3 and `matplotlib`.
 
+- Save two figures (raw + EMA), auto-detect unit (ms/us/ns) from CSV header, filter out zero values:
+
 ```
+python3 scripts/plot_latency.py out.csv --out latency
+# or specify extension
 python3 scripts/plot_latency.py out.csv --out latency.png
 ```
-The plotting script autodetects `ms/us/ns` in the CSV header.
 
-This produces a figure with p50 and p99 latency over time per connection, letting you visually inspect whether a specific connection is systematically faster or just transiently leading.
+Outputs:
+- `latency_raw.png`: p50/p99 vs `ts_epoch_ms` (x-axis is epoch ms; y-axis is latency in the CSV unit). Zero/count=0 rows are excluded.
+- `latency_ema.png`: per-connection EMA of p50/p99 vs `ts_epoch_ms`. Tune smoothing with `--ema-alpha` (default 0.2).
 
 
 How to run
@@ -68,9 +73,11 @@ How to run
 
 Plotting
 
-- Requires Python 3 and matplotlib:
-    - pip install matplotlib
-    - python3 binance_ws_latency_benchmark/scripts/plot_latency.py binance_ws_latency_benchmark/out.csv --out binance_ws_latency_benchmark/latency.png
+- Install deps (once):
+    - `pip install matplotlib`
+- Examples:
+    - `python3 scripts/plot_latency.py out.csv --out latency` (generates `latency_raw.png` and `latency_ema.png`)
+    - `python3 scripts/plot_latency.py out.csv --out latency.png --ema-alpha 0.3`
 
 Notes
 
