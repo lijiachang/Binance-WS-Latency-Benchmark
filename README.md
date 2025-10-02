@@ -2,6 +2,8 @@
 
 Measure per-connection latency for Binance Futures bookTicker using N parallel WebSockets. Records histograms, prints periodic summaries, and optionally exports 1-second window stats to CSV for plotting.
 
+![img.png](img.png)
+
 ## Build
 
 ```
