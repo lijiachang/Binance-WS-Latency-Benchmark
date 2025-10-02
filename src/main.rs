@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use futures_util::{SinkExt, StreamExt};
 use hdrhistogram::Histogram;
 use reqwest::Client;
@@ -66,6 +66,35 @@ struct Opts {
     /// Ping interval seconds (0 = disable app-level pings)
     #[arg(long, default_value_t = 15u64)]
     ping_interval_secs: u64,
+
+    /// Display unit for latency in summaries: ms | us | ns
+    #[arg(long, value_enum, default_value_t = LatencyUnit::Us)]
+    latency_unit: LatencyUnit,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum LatencyUnit {
+    Ms,
+    Us,
+    Ns,
+}
+
+impl LatencyUnit {
+    fn scale_factor(self) -> u64 {
+        match self {
+            LatencyUnit::Ms => 1,
+            LatencyUnit::Us => 1_000,
+            LatencyUnit::Ns => 1_000_000,
+        }
+    }
+
+    fn suffix(self) -> &'static str {
+        match self {
+            LatencyUnit::Ms => "ms",
+            LatencyUnit::Us => "µs",
+            LatencyUnit::Ns => "ns",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -212,7 +241,7 @@ async fn main() -> Result<()> {
             }
 
             _ = print_int.tick() => {
-                print_summary(&conns_total);
+                print_summary(&conns_total, opts.latency_unit);
             }
 
             _ = window_int.tick() => {
@@ -260,11 +289,11 @@ async fn main() -> Result<()> {
 
     // final summary
     println!("\n========== FINAL SUMMARY ==========");
-    print_summary(&conns_total);
+    print_summary(&conns_total, opts.latency_unit);
 
     // write CSV if requested
     if let Some(path) = &opts.window_csv {
-        if let Err(e) = write_csv(path, &windows) {
+        if let Err(e) = write_csv(path, &windows, opts.latency_unit) {
             error!(error=?e, "Failed to write CSV");
         } else {
             info!("Wrote CSV window stats to {}", path);
@@ -509,18 +538,58 @@ fn percentile(h: &Histogram<u64>, p: f64) -> f64 {
     }
 }
 
-fn print_summary(conns: &[ConnAgg]) {
+fn print_summary(conns: &[ConnAgg], unit: LatencyUnit) {
     println!("----- Summary ({} conns) -----", conns.len());
     for (i, agg) in conns.iter().enumerate() {
-        let p50 = percentile(&agg.total_hist, 50.0);
-        let p90 = percentile(&agg.total_hist, 90.0);
-        let p99 = percentile(&agg.total_hist, 99.0);
-        let max = agg.total_hist.max();
+        let p50_ms = percentile(&agg.total_hist, 50.0);
+        let p90_ms = percentile(&agg.total_hist, 90.0);
+        let p99_ms = percentile(&agg.total_hist, 99.0);
+        let max_ms = agg.total_hist.max();
+
+        let p50 = format_latency_scaled_int(p50_ms, unit.clone());
+        let p90 = format_latency_scaled_int(p90_ms, unit.clone());
+        let p99 = format_latency_scaled_int(p99_ms, unit.clone());
+        let max = format_int_with_commas((max_ms as u128) * (unit.scale_factor() as u128));
+
+        let count_fmt = format_int_with_commas(agg.total_count as u128);
         println!(
-            "conn {:02}: count={:<9} p50={:>6.1}ms p90={:>6.1}ms p99={:>6.1}ms max={}ms",
-            i, agg.total_count, p50, p90, p99, max
+            "conn {:02}: count={} p50={} {} p90={} {} p99={} {} max={} {}",
+            i,
+            count_fmt,
+            p50,
+            unit.suffix(),
+            p90,
+            unit.suffix(),
+            p99,
+            unit.suffix(),
+            max,
+            unit.suffix()
         );
     }
+}
+
+fn format_latency_scaled_int(value_ms: f64, unit: LatencyUnit) -> String {
+    let scaled: u128 = ((value_ms * unit.scale_factor() as f64).round() as i128).max(0) as u128;
+    format_int_with_commas(scaled)
+}
+
+fn format_int_with_commas(mut n: u128) -> String {
+    // Handles only non-negative integers; suitable for counts/latencies here
+    let mut parts: Vec<String> = Vec::new();
+    if n == 0 {
+        return "0".to_string();
+    }
+    while n > 0 {
+        let chunk = (n % 1000) as u16;
+        n /= 1000;
+        if n > 0 {
+            parts.push(format!("{:03}", chunk));
+        } else {
+            parts.push(format!("{}", chunk));
+        }
+    }
+    parts.reverse();
+    parts.join(",")
 }
 
 struct WindowRow {
@@ -534,20 +603,34 @@ struct WindowRow {
     max_ms: u64,
 }
 
-fn write_csv(path: &str, rows: &[WindowRow]) -> Result<()> {
+fn write_csv(path: &str, rows: &[WindowRow], unit: LatencyUnit) -> Result<()> {
     use std::fs::File;
     use std::io::{BufWriter, Write};
     let f = File::create(path)?;
     let mut w = BufWriter::new(f);
+    let suf = match unit { LatencyUnit::Ms => "ms", LatencyUnit::Us => "us", LatencyUnit::Ns => "ns" };
     writeln!(
         w,
-        "ts_epoch_ms,conn_id,count,drops,p50_ms,p90_ms,p99_ms,max_ms"
+        "ts_epoch_ms,conn_id,count,drops,p50_{s},p90_{s},p99_{s},max_{s}",
+        s = suf
     )?;
     for r in rows {
+        let scale = unit.scale_factor() as f64;
+        let p50 = (r.p50_ms * scale).round();
+        let p90 = (r.p90_ms * scale).round();
+        let p99 = (r.p99_ms * scale).round();
+        let max = (r.max_ms as f64 * scale).round() as u128;
         writeln!(
             w,
-            "{},{},{},{},{:.3},{:.3},{:.3},{}",
-            r.ts_epoch_ms, r.conn_id, r.count, r.drops, r.p50_ms, r.p90_ms, r.p99_ms, r.max_ms
+            "{},{},{},{},{},{},{},{}",
+            r.ts_epoch_ms,
+            r.conn_id,
+            r.count,
+            r.drops,
+            p50 as u128,
+            p90 as u128,
+            p99 as u128,
+            max
         )?;
     }
     w.flush()?;

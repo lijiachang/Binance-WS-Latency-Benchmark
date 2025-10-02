@@ -13,13 +13,21 @@ def load_csv(path: str):
     # Each row: ts_epoch_ms,conn_id,count,drops,p50_ms,p90_ms,p99_ms,max_ms
     with open(path, newline="") as f:
         r = csv.DictReader(f)
+        # Detect latency unit columns dynamically: p50_ms|us|ns
+        unit_suffix = None
+        for s in ("ms", "us", "ns"):
+            if f"p50_{s}" in r.fieldnames or f"p90_{s}" in r.fieldnames:
+                unit_suffix = s
+                break
+        if unit_suffix is None:
+            raise ValueError("CSV missing p50_[ms|us|ns] columns")
         for row in r:
             ts = int(row["ts_epoch_ms"])  # epoch ms (server-adjusted)
             cid = int(row["conn_id"])
-            p50 = float(row["p50_ms"]) if row["p50_ms"] else 0.0
-            p90 = float(row["p90_ms"]) if row["p90_ms"] else 0.0
-            p99 = float(row["p99_ms"]) if row["p99_ms"] else 0.0
-            max_ms = float(row["max_ms"]) if row["max_ms"] else 0.0
+            p50 = float(row.get(f"p50_{unit_suffix}") or 0.0)
+            p90 = float(row.get(f"p90_{unit_suffix}") or 0.0)
+            p99 = float(row.get(f"p99_{unit_suffix}") or 0.0)
+            max_ms = float(row.get(f"max_{unit_suffix}") or 0.0)
             count = int(row["count"]) if row["count"] else 0
             per_conn[cid].append((ts, p50, p90, p99, max_ms, count))
             times.append(ts)
@@ -77,4 +85,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
