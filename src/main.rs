@@ -151,23 +151,23 @@ async fn main() -> Result<()> {
 
     // anchor mapping: Instant -> epoch ms
     let anchor_instant = Instant::now();
-    let anchor_epoch_ms = epoch_ms_now();
+    let anchor_epoch_ns = epoch_ns_now();
 
     // shared server time offset (ms). server_epoch ~= local_epoch + offset
-    let offset_ms = Arc::new(AtomicI64::new(0));
+    let offset_ns = Arc::new(AtomicI64::new(0));
 
     // spawn time sync task
     let http = Client::builder()
         .user_agent("binance-ws-latency-bench/0.1")
         .timeout(Duration::from_secs(5))
         .build()?;
-    let offset_clone = offset_ms.clone();
+    let offset_clone = offset_ns.clone();
     let time_sync_handle = tokio::spawn(time_sync_task(
         http.clone(),
         opts.time_sync_interval_secs,
         offset_clone,
         anchor_instant,
-        anchor_epoch_ms,
+        anchor_epoch_ns,
     ));
 
     let ws_url = stream_url(&opts.ws_base, &opts.symbol, opts.all);
@@ -180,7 +180,7 @@ async fn main() -> Result<()> {
     for conn_id in 0..opts.connections {
         let tx_clone = tx.clone();
         let url = ws_url.clone();
-        let offset = offset_ms.clone();
+        let offset = offset_ns.clone();
         let opts_ws = opts.clone();
         tokio::spawn(async move {
             loop {
@@ -245,7 +245,8 @@ async fn main() -> Result<()> {
             }
 
             _ = window_int.tick() => {
-                let now_epoch_ms = instant_to_epoch_ms(Instant::now(), anchor_instant, anchor_epoch_ms) + offset_ms.load(Ordering::Relaxed);
+                let now_epoch_ns = instant_to_epoch_ns(Instant::now(), anchor_instant, anchor_epoch_ns) + offset_ns.load(Ordering::Relaxed);
+                let now_epoch_ms = now_epoch_ns / 1_000_000; // keep window timestamps in ms
                 // finalize one-second window per connection
                 for (id, agg) in conns_total.iter_mut().enumerate() {
                     let row = agg.finalize_window_row(id, now_epoch_ms);
@@ -259,15 +260,17 @@ async fn main() -> Result<()> {
                         let conn_id = sample.conn_id;
                         if let Some(agg) = conns_total.get_mut(conn_id) {
                             // Convert recv instant to estimated server epoch ms
-                            let local_server_epoch_ms = instant_to_epoch_ms(sample.recv_instant, anchor_instant, anchor_epoch_ms)
-                                + offset_ms.load(Ordering::Relaxed);
-                            let evt_ms = sample.event_time_ms;
-                            let mut latency_ms = local_server_epoch_ms - evt_ms;
-                            if latency_ms < 0 {
+                            let local_server_epoch_ns = instant_to_epoch_ns(sample.recv_instant, anchor_instant, anchor_epoch_ns)
+                                + offset_ns.load(Ordering::Relaxed);
+                            let evt_ns = sample.event_time_ms * 1_000_000; // server event time in ns
+                            let mut latency_ns = local_server_epoch_ns - evt_ns;
+                            if latency_ns < 0 {
                                 // due to clock noise or asymmetry; clamp
-                                latency_ms = 0;
+                                latency_ns = 0;
                             }
-                            agg.record(latency_ms as u64);
+                            // record in microseconds (rounded)
+                            let latency_us = ((latency_ns + 500) / 1_000) as u64;
+                            agg.record(latency_us);
                         }
                     }
                     None => {
@@ -281,7 +284,8 @@ async fn main() -> Result<()> {
     }
 
     // final one more window flush
-    let now_epoch_ms = instant_to_epoch_ms(Instant::now(), anchor_instant, anchor_epoch_ms) + offset_ms.load(Ordering::Relaxed);
+    let now_epoch_ns = instant_to_epoch_ns(Instant::now(), anchor_instant, anchor_epoch_ns) + offset_ns.load(Ordering::Relaxed);
+    let now_epoch_ms = now_epoch_ns / 1_000_000;
     for (id, agg) in conns_total.iter_mut().enumerate() {
         let row = agg.finalize_window_row(id, now_epoch_ms);
         windows.push(row);
@@ -317,25 +321,28 @@ fn validate_opts(opts: &Opts) -> Result<()> {
 }
 
 // epoch ms at now()
-fn epoch_ms_now() -> i64 {
+fn epoch_ns_now() -> i64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time before epoch");
-    (now.as_secs() as i64) * 1000 + (now.subsec_millis() as i64)
+    (now.as_secs() as i64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(now.subsec_nanos() as i64)
 }
 
-// map an Instant to epoch ms using anchor
-fn instant_to_epoch_ms(now: Instant, anchor_instant: Instant, anchor_epoch_ms: i64) -> i64 {
+// map an Instant to epoch ns using anchor
+fn instant_to_epoch_ns(now: Instant, anchor_instant: Instant, anchor_epoch_ns: i64) -> i64 {
     let delta = now.saturating_duration_since(anchor_instant);
-    anchor_epoch_ms + delta.as_millis() as i64
+    let add_ns = delta.as_nanos() as i64; // safe for reasonable runtimes
+    anchor_epoch_ns.saturating_add(add_ns)
 }
 
 async fn time_sync_task(
     http: Client,
     interval_secs: u64,
-    offset_ms: Arc<AtomicI64>,
+    offset_ns: Arc<AtomicI64>,
     anchor_instant: Instant,
-    anchor_epoch_ms: i64,
+    anchor_epoch_ns: i64,
 ) {
     let url = "https://fapi.binance.com/fapi/v1/time";
     let mut intv = interval(Duration::from_secs(interval_secs.max(5)));
@@ -344,20 +351,21 @@ async fn time_sync_task(
     loop {
         intv.tick().await;
         let t0 = Instant::now();
-        let local0_ms = instant_to_epoch_ms(t0, anchor_instant, anchor_epoch_ms);
+        let local0_ns = instant_to_epoch_ns(t0, anchor_instant, anchor_epoch_ns);
         match http.get(url).send().await {
             Ok(resp) => match resp.json::<ServerTime>().await {
                 Ok(res) => {
                     let t1 = Instant::now();
-                    let local1_ms = instant_to_epoch_ms(t1, anchor_instant, anchor_epoch_ms);
-                    let rtt_ms = (local1_ms - local0_ms).max(1);
-                    let midpoint_local_ms = local0_ms + (rtt_ms / 2);
-                    let new_offset = (res.serverTime as i64) - midpoint_local_ms;
-                    offset_ms.store(new_offset, Ordering::Relaxed);
+                    let local1_ns = instant_to_epoch_ns(t1, anchor_instant, anchor_epoch_ns);
+                    let rtt_ns = (local1_ns - local0_ns).max(1);
+                    let midpoint_local_ns = local0_ns + (rtt_ns / 2);
+                    let server_ns = (res.serverTime as i64).saturating_mul(1_000_000);
+                    let new_offset = server_ns - midpoint_local_ns;
+                    offset_ns.store(new_offset, Ordering::Relaxed);
                     info!(
                         server_time = res.serverTime,
-                        offset_ms = new_offset,
-                        rtt_ms = rtt_ms,
+                        offset_ns = new_offset,
+                        rtt_ns = rtt_ns,
                         "time sync updated"
                     );
                 }
@@ -482,11 +490,11 @@ fn parse_event_time_symbol(s: &str) -> Option<(i64, Option<String>)> {
 }
 
 struct ConnAgg {
-    // cumulative stats
+    // cumulative stats (microseconds)
     total_hist: Histogram<u64>,
     total_count: u64,
     total_drops: u64,
-    // per-second window
+    // per-second window (microseconds)
     window_hist: Histogram<u64>,
     window_count: u64,
 }
@@ -494,9 +502,9 @@ struct ConnAgg {
 impl ConnAgg {
     fn new() -> Self {
         let total_hist =
-            Histogram::new_with_bounds(1, 120_000, 3).expect("histogram bounds"); // 1ms .. 120s
+            Histogram::new_with_bounds(1, 120_000_000, 3).expect("histogram bounds"); // 1us .. 120s
         let window_hist =
-            Histogram::new_with_bounds(1, 120_000, 3).expect("histogram bounds");
+            Histogram::new_with_bounds(1, 120_000_000, 3).expect("histogram bounds");
         Self {
             total_hist,
             total_count: 0,
@@ -506,9 +514,10 @@ impl ConnAgg {
         }
     }
 
-    fn record(&mut self, latency_ms: u64) {
-        let _ = self.total_hist.record(latency_ms.min(120_000));
-        let _ = self.window_hist.record(latency_ms.min(120_000));
+    fn record(&mut self, latency_us: u64) {
+        let capped = latency_us.min(120_000_000);
+        let _ = self.total_hist.record(capped);
+        let _ = self.window_hist.record(capped);
         self.total_count += 1;
         self.window_count += 1;
     }
@@ -519,10 +528,10 @@ impl ConnAgg {
             conn_id,
             count: self.window_count,
             drops: 0, // not tracked per-window currently
-            p50_ms: percentile(&self.window_hist, 50.0),
-            p90_ms: percentile(&self.window_hist, 90.0),
-            p99_ms: percentile(&self.window_hist, 99.0),
-            max_ms: self.window_hist.max(),
+            p50_us: percentile(&self.window_hist, 50.0),
+            p90_us: percentile(&self.window_hist, 90.0),
+            p99_us: percentile(&self.window_hist, 99.0),
+            max_us: self.window_hist.max(),
         };
         self.window_hist.reset();
         self.window_count = 0;
@@ -541,36 +550,36 @@ fn percentile(h: &Histogram<u64>, p: f64) -> f64 {
 fn print_summary(conns: &[ConnAgg], unit: LatencyUnit) {
     println!("----- Summary ({} conns) -----", conns.len());
     for (i, agg) in conns.iter().enumerate() {
-        let p50_ms = percentile(&agg.total_hist, 50.0);
-        let p90_ms = percentile(&agg.total_hist, 90.0);
-        let p99_ms = percentile(&agg.total_hist, 99.0);
-        let max_ms = agg.total_hist.max();
+        let p50_us = percentile(&agg.total_hist, 50.0);
+        let p90_us = percentile(&agg.total_hist, 90.0);
+        let p99_us = percentile(&agg.total_hist, 99.0);
+        let max_us = agg.total_hist.max();
 
-        let p50 = format_latency_scaled_int(p50_ms, unit.clone());
-        let p90 = format_latency_scaled_int(p90_ms, unit.clone());
-        let p99 = format_latency_scaled_int(p99_ms, unit.clone());
-        let max = format_int_with_commas((max_ms as u128) * (unit.scale_factor() as u128));
+        let p50 = format_latency_from_us(p50_us, unit);
+        let p90 = format_latency_from_us(p90_us, unit);
+        let p99 = format_latency_from_us(p99_us, unit);
+        let max = format_latency_from_us(max_us as f64, unit);
 
         let count_fmt = format_int_with_commas(agg.total_count as u128);
         println!(
             "conn {:02}: count={} p50={} {} p90={} {} p99={} {} max={} {}",
             i,
             count_fmt,
-            p50,
-            unit.suffix(),
-            p90,
-            unit.suffix(),
-            p99,
-            unit.suffix(),
-            max,
-            unit.suffix()
+            p50, unit.suffix(),
+            p90, unit.suffix(),
+            p99, unit.suffix(),
+            max, unit.suffix()
         );
     }
 }
 
-fn format_latency_scaled_int(value_ms: f64, unit: LatencyUnit) -> String {
-    let scaled: u128 = ((value_ms * unit.scale_factor() as f64).round() as i128).max(0) as u128;
-    format_int_with_commas(scaled)
+fn format_latency_from_us(value_us: f64, unit: LatencyUnit) -> String {
+    let scaled: i128 = match unit {
+        LatencyUnit::Ms => ((value_us / 1_000.0).round() as i128).max(0),
+        LatencyUnit::Us => (value_us.round() as i128).max(0),
+        LatencyUnit::Ns => ((value_us * 1_000.0).round() as i128).max(0),
+    };
+    format_int_with_commas(scaled as u128)
 }
 
 fn format_int_with_commas(mut n: u128) -> String {
@@ -597,10 +606,10 @@ struct WindowRow {
     conn_id: usize,
     count: u64,
     drops: u64,
-    p50_ms: f64,
-    p90_ms: f64,
-    p99_ms: f64,
-    max_ms: u64,
+    p50_us: f64,
+    p90_us: f64,
+    p99_us: f64,
+    max_us: u64,
 }
 
 fn write_csv(path: &str, rows: &[WindowRow], unit: LatencyUnit) -> Result<()> {
@@ -615,11 +624,10 @@ fn write_csv(path: &str, rows: &[WindowRow], unit: LatencyUnit) -> Result<()> {
         s = suf
     )?;
     for r in rows {
-        let scale = unit.scale_factor() as f64;
-        let p50 = (r.p50_ms * scale).round();
-        let p90 = (r.p90_ms * scale).round();
-        let p99 = (r.p99_ms * scale).round();
-        let max = (r.max_ms as f64 * scale).round() as u128;
+        let p50 = match unit { LatencyUnit::Ms => (r.p50_us / 1_000.0).round(), LatencyUnit::Us => r.p50_us.round(), LatencyUnit::Ns => (r.p50_us * 1_000.0).round() };
+        let p90 = match unit { LatencyUnit::Ms => (r.p90_us / 1_000.0).round(), LatencyUnit::Us => r.p90_us.round(), LatencyUnit::Ns => (r.p90_us * 1_000.0).round() };
+        let p99 = match unit { LatencyUnit::Ms => (r.p99_us / 1_000.0).round(), LatencyUnit::Us => r.p99_us.round(), LatencyUnit::Ns => (r.p99_us * 1_000.0).round() };
+        let max = match unit { LatencyUnit::Ms => ((r.max_us as f64) / 1_000.0).round(), LatencyUnit::Us => r.max_us as f64, LatencyUnit::Ns => (r.max_us as f64) * 1_000.0 } as u128;
         writeln!(
             w,
             "{},{},{},{},{},{},{},{}",

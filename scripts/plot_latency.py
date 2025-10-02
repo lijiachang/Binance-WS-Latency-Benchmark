@@ -35,10 +35,10 @@ def load_csv(path: str):
         t0 = min(times)
     else:
         t0 = 0
-    return t0, per_conn
+    return t0, per_conn, unit_suffix
 
 
-def plot(per_conn, t0, title_prefix: str, out: str = None, show: bool = True):
+def plot(per_conn, t0, unit: str, title_prefix: str, out: str = None, show: bool = True):
     # Prepare figure with two subplots: p50 and p99
     fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
     ax1, ax2 = axes
@@ -51,8 +51,8 @@ def plot(per_conn, t0, title_prefix: str, out: str = None, show: bool = True):
         ax1.plot(xs, p50, label=f"conn {cid:02}")
         ax2.plot(xs, p99, label=f"conn {cid:02}")
 
-    ax1.set_ylabel("p50 latency (ms)")
-    ax2.set_ylabel("p99 latency (ms)")
+    ax1.set_ylabel(f"p50 latency ({unit})")
+    ax2.set_ylabel(f"p99 latency ({unit})")
     ax2.set_xlabel("time since start (s)")
     ax1.grid(True, alpha=0.3)
     ax2.grid(True, alpha=0.3)
@@ -76,11 +76,11 @@ def main():
     parser.add_argument("--title", default="Binance Futures", help="Title prefix")
     args = parser.parse_args()
 
-    t0, per_conn = load_csv(args.csv)
+    t0, per_conn, unit = load_csv(args.csv)
     if not per_conn:
         print("No data found in CSV.")
         return
-    plot(per_conn, t0, args.title, out=args.out, show=not args.no_show)
+    plot(per_conn, t0, unit, args.title, out=args.out, show=not args.no_show)
 
 
 if __name__ == "__main__":
